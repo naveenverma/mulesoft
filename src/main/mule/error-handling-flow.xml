@@ -1,0 +1,218 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xmlns:file="http://www.mulesoft.org/schema/mule/file"
+      xmlns:dw="http://www.mulesoft.org/schema/mule/ee/dw"
+      xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/file http://www.mulesoft.org/schema/mule/file/current/mule-file.xsd
+        http://www.mulesoft.org/schema/mule/ee/dw http://www.mulesoft.org/schema/mule/ee/dw/current/dw.xsd
+        http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/ee.xsd">
+
+    <!-- ========================================================================= -->
+    <!-- Error Handling Layer                                                      -->
+    <!-- ========================================================================= -->
+    <!--
+        Centralized error handling for the GL integration.
+        
+        Error Categories:
+        - Rejected records (validation failures)
+        - Error queue records (invalid accounts, etc.)
+        - API failures (timeout, auth failure, server error)
+        - Mapping failures
+        - System errors
+    ========================================================================= -->
+
+    <!-- ========================================================================= -->
+    <!-- Handle Rejected Record                                                    -->
+    <!-- ========================================================================= -->
+
+    <flow name="Handle-Rejected-Record">
+        <description>
+            Processes a rejected record: logs it, writes to error CSV,
+            and tracks rejection metrics.
+        </description>
+
+        <try>
+            <ee:transform>
+                <ee:message>
+                    <ee:set-payload>
+                        <![CDATA[%dw 2.0
+                        output application/json
+                        ---
+                        {
+                            recordId: payload.ReferenceNumber default "UNKNOWN",
+                            transactionId: vars.transactionId default "N/A",
+                            rejectionReason: payload.rejectionReason default "UNKNOWN",
+                            missingFields: payload.missingFields default [],
+                            record: payload,
+                            timestamp: now() as String {format: "yyyy-MM-dd'T'HH:mm:ssZ"},
+                            environment: p("environment")
+                        }]]>
+                    </ee:set-payload>
+                </ee:message>
+            </ee:transform>
+
+            <logger level="WARN" message="REJECTED: #[payload.recordId] - #[payload.rejectionReason]"/>
+
+            <!-- Append to error CSV file -->
+            <file:write config-ref="File-Error-Config"
+                        path="rejected-records-$(now() as String {format: 'yyyyMMdd'}).csv"
+                        append="true">
+                <file:content>
+                    <![CDATA[#[payload.recordId],#[payload.rejectionReason],#[payload.timestamp],#[payload.transactionId]\n]]>
+                </file:content>
+            </file:write>
+
+        </try>
+        <error-handler>
+            <on-error-continue type="ANY">
+                <logger level="ERROR" message="Failed to process rejected record: #[error.description]"/>
+            </on-error-continue>
+        </error-handler>
+    </flow>
+
+    <!-- ========================================================================= -->
+    <!-- Handle Error Queue Record                                                 -->
+    <!-- ========================================================================= -->
+
+    <flow name="Handle-Error-Queue-Record">
+        <description>
+            Processes a record that failed account validation:
+            logs it, writes to error queue file, and tracks metrics.
+        </description>
+
+        <try>
+            <ee:transform>
+                <ee:message>
+                    <ee:set-payload>
+                        <![CDATA[%dw 2.0
+                        output application/json
+                        ---
+                        {
+                            recordId: payload.ReferenceNumber default "UNKNOWN",
+                            transactionId: vars.transactionId default "N/A",
+                            errorType: "ACCOUNT_VALIDATION",
+                            accountErrors: payload.accountErrors default [],
+                            record: payload,
+                            timestamp: now() as String {format: "yyyy-MM-dd'T'HH:mm:ssZ"},
+                            environment: p("environment")
+                        }]]>
+                    </ee:set-payload>
+                </ee:message>
+            </ee:transform>
+
+            <logger level="WARN" message="ERROR QUEUE: #[payload.recordId] - Account errors: #[payload.accountErrors]"/>
+
+            <!-- Write to error queue file -->
+            <file:write config-ref="File-Error-Config"
+                        path="error-queue-$(now() as String {format: 'yyyyMMdd'}).json"
+                        append="true">
+                <file:content>#[payload.record | (payload.record) ++ {errors: payload.accountErrors}] ++ '\n'</file:content>
+            </file:write>
+
+        </try>
+        <error-handler>
+            <on-error-continue type="ANY">
+                <logger level="ERROR" message="Failed to process error queue record: #[error.description]"/>
+            </on-error-continue>
+        </error-handler>
+    </flow>
+
+    <!-- ========================================================================= -->
+    <!-- Handle API Failure                                                        -->
+    <!-- ========================================================================= -->
+
+    <flow name="Handle-API-Failure">
+        <description>
+            Handles SKY API communication failures with logging and alerting.
+        </description>
+
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload>
+                    <![CDATA[%dw 2.0
+                    output application/json
+                    ---
+                    {
+                        errorType: "API_FAILURE",
+                        transactionId: vars.transactionId default "N/A",
+                        httpStatus: attributes.statusCode default null,
+                        errorMessage: error.description,
+                        retryAttempt: vars.retryCount default 0,
+                        timestamp: now() as String {format: "yyyy-MM-dd'T'HH:mm:ssZ"}
+                    }]]>
+                </ee:set-payload>
+            </ee:message>
+        </ee:transform>
+
+        <logger level="ERROR" message="API FAILURE: #[payload.errorType] - #[payload.errorMessage]"/>
+
+        <!-- Write to error log file -->
+        <file:write config-ref="File-Error-Config"
+                    path="api-failures-$(now() as String {format: 'yyyyMMdd'}).log"
+                    append="true">
+            <file:content>#[payload] ++ '\n'</file:content>
+        </file:write>
+    </flow>
+
+    <!-- ========================================================================= -->
+    <!-- Handle Mapping Failure                                                    -->
+    <!-- ========================================================================= -->
+
+    <flow name="Handle-Mapping-Failure">
+        <description>
+            Handles DataWeave transformation failures.
+        </description>
+
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload>
+                    <![CDATA[%dw 2.0
+                    output application/json
+                    ---
+                    {
+                        errorType: "MAPPING_FAILURE",
+                        transactionId: vars.transactionId default "N/A",
+                        errorMessage: error.description,
+                        record: vars.currentRecord default null,
+                        timestamp: now() as String {format: "yyyy-MM-dd'T'HH:mm:ssZ"}
+                    }]]>
+                </ee:set-payload>
+            </ee:message>
+        </ee:transform>
+
+        <logger level="ERROR" message="MAPPING FAILURE: #[payload.errorMessage]"/>
+    </flow>
+
+    <!-- ========================================================================= -->
+    <!-- Log Rejected Records Batch                                                -->
+    <!-- ========================================================================= -->
+
+    <sub-flow name="Log-Rejected-Records">
+        <description>Logs all rejected records to the audit log</description>
+        <foreach collection="#[payload.rejected]">
+            <flow-ref name="Handle-Rejected-Record"/>
+        </foreach>
+    </sub-flow>
+
+    <!-- ========================================================================= -->
+    <!-- Log Rejected Record                                                      -->
+    <!-- ========================================================================= -->
+
+    <sub-flow name="Log-Rejected-Record">
+        <description>Logs a single rejected record</description>
+        <logger level="WARN" message="Rejected Record: #[payload.ReferenceNumber] - #[payload.rejectionReason]"/>
+    </sub-flow>
+
+    <!-- ========================================================================= -->
+    <!-- Log Error Queue Record                                                   -->
+    <!-- ========================================================================= -->
+
+    <sub-flow name="Log-Error-Queue-Record">
+        <description>Logs a single error queue record</description>
+        <logger level="WARN" message="Error Queue Record: #[payload.ReferenceNumber] - #[payload.accountErrors]"/>
+    </sub-flow>
+
+</mule>

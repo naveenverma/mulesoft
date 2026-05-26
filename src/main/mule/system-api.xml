@@ -1,0 +1,248 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:dw="http://www.mulesoft.org/schema/mule/ee/dw"
+      xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+      xmlns:scripting="http://www.mulesoft.org/schema/mule/scripting"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+        http://www.mulesoft.org/schema/mule/ee/dw http://www.mulesoft.org/schema/mule/ee/dw/current/dw.xsd
+        http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/ee.xsd
+        http://www.mulesoft.org/schema/mule/scripting http://www.mulesoft.org/schema/mule/scripting/current/mule-scripting.xsd">
+
+    <!-- ========================================================================= -->
+    <!-- System API Layer                                                          -->
+    <!-- ========================================================================= -->
+    <!--
+        Blackbaud SKY API communication layer.
+        Responsibilities:
+        - SKY API HTTP communication
+        - Authentication header injection
+        - Retry logic (429, 500, 401 handling)
+        - Mock response support for development
+        - API timeout handling
+        
+        NOTE: Actual endpoint paths require client confirmation.
+        The journal entry batch endpoint path below is a best-guess based
+        on documented patterns.
+    ========================================================================= -->
+
+    <!-- ========================================================================= -->
+    <!-- Send Journal Entry Batch to SKY API                                      -->
+    <!-- ========================================================================= -->
+
+    <flow name="Send-Journal-Entry-Batch-Sub-Flow">
+        <description>
+            Sends a journal entry batch payload to the Blackbaud SKY API.
+            Includes retry logic for transient failures.
+            
+            REQUIRES CLIENT CONFIRMATION: Confirm the exact endpoint path.
+            Possible paths:
+            - POST /journalentrybatches  (original, may be deprecated)
+            - POST /journalentrybatchprocess (newer process-based pattern)
+        </description>
+
+        <try>
+            <!-- Get OAuth token -->
+            <flow-ref name="Get-OAuth-Token-Sub-Flow"/>
+            <set-variable value="#[payload]" variableName="bearerToken"/>
+
+            <!-- Check if mock mode is enabled -->
+            <choice>
+                <when expression="#[p('sky.api.mock.enabled') == 'true']">
+                    <flow-ref name="Mock-SKY-API-Response"/>
+                </when>
+                <otherwise>
+                    <flow-ref name="Submit-To-SKY-API"/>
+                </otherwise>
+            </choice>
+
+            <error-handler>
+                <!-- HTTP 429: Rate limited - retry with backoff -->
+                <on-error-continue type="HTTP:TOO_MANY_REQUESTS">
+                    <flow-ref name="Retry-With-Backoff"/>
+                </on-error-continue>
+
+                <!-- HTTP 500/503: Server error - retry -->
+                <on-error-continue type="HTTP:SERVICE_UNAVAILABLE">
+                    <flow-ref name="Retry-With-Backoff"/>
+                </on-error-continue>
+                <on-error-continue type="HTTP:INTERNAL_SERVER_ERROR">
+                    <flow-ref name="Retry-With-Backoff"/>
+                </on-error-continue>
+
+                <!-- HTTP 401: Unauthorized - refresh token then retry -->
+                <on-error-continue type="HTTP:UNAUTHORIZED">
+                    <logger level="WARN" message="SKY API returned 401. Refreshing token and retrying..."/>
+                    <flow-ref name="Refresh-OAuth-Token"/>
+                    <flow-ref name="Submit-To-SKY-API"/>
+                </on-error-continue>
+
+                <!-- HTTP 400: Bad request - log and fail (no retry) -->
+                <on-error-continue type="HTTP:BAD_REQUEST">
+                    <logger level="ERROR" message="SKY API returned 400 Bad Request. Payload: #[payload]"/>
+                    <flow-ref name="Log-Error-Flow"/>
+                    <set-payload value="#[{status: 'FAILED', errorType: 'BAD_REQUEST', errorMessage: error.description}]"/>
+                </on-error-continue>
+
+                <!-- HTTP 404: Not Found - log and fail -->
+                <on-error-continue type="HTTP:NOT_FOUND">
+                    <logger level="ERROR" message="SKY API endpoint not found. Check endpoint path configuration."/>
+                    <flow-ref name="Log-Error-Flow"/>
+                    <set-payload value="#[{status: 'FAILED', errorType: 'NOT_FOUND', errorMessage: error.description}]"/>
+                </on-error-continue>
+
+                <!-- Timeout - retry -->
+                <on-error-continue type="HTTP:TIMEOUT">
+                    <logger level="WARN" message="SKY API request timed out. Retrying..."/>
+                    <flow-ref name="Retry-With-Backoff"/>
+                </on-error-continue>
+
+                <!-- Any other error -->
+                <on-error-continue type="ANY">
+                    <logger level="ERROR" message="SKY API request failed: #[error.description]"/>
+                    <flow-ref name="Log-Error-Flow"/>
+                    <set-payload value="#[{status: 'FAILED', errorType: 'API_ERROR', errorMessage: error.description}]"/>
+                </on-error-continue>
+            </error-handler>
+        </try>
+    </flow>
+
+    <!-- ========================================================================= -->
+    <!-- Submit To SKY API                                                         -->
+    <!-- ========================================================================= -->
+
+    <sub-flow name="Submit-To-SKY-API">
+        <description>Submits the journal entry batch payload to the SKY API</description>
+
+        <http:request method="POST"
+                       config-ref="SKY-API-HTTP-Config"
+                       path="/fe/general-ledger/journalentrybatches">
+            <http:headers>#[
+                {
+                    "Content-Type": "application/json",
+                    "Authorization": "Bearer $(vars.bearerToken)",
+                    "Bb-Api-Subscription-Key": p("sky.api.subscription.key")
+                }
+            ]</http:headers>
+        </http:request>
+
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload>
+                    <![CDATA[%dw 2.0
+                    output application/json
+                    ---
+                    {
+                        status: if (attributes.statusCode == 200 or attributes.statusCode == 201) "SUCCESS" else "FAILED",
+                        httpStatus: attributes.statusCode,
+                        batchId: payload.id default null,
+                        response: payload,
+                        timestamp: now() as String {format: "yyyy-MM-dd'T'HH:mm:ssZ"}
+                    }]]>
+                </ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </sub-flow>
+
+    <!-- ========================================================================= -->
+    <!-- Mock Response (for development without live API access)                  -->
+    <!-- ========================================================================= -->
+
+    <sub-flow name="Mock-SKY-API-Response">
+        <description>
+            Returns a mock successful response for development/testing
+            when live SKY API access is unavailable.
+        </description>
+
+        <logger level="INFO" message="MOCK MODE: Returning simulated SKY API response"/>
+        <logger level="DEBUG" message="MOCK MODE - Payload received: #[payload]"/>
+
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload>
+                    <![CDATA[%dw 2.0
+                    output application/json
+                    ---
+                    {
+                        status: "SUCCESS",
+                        httpStatus: 201,
+                        batchId: "MOCK-" ++ (now() as String {format: "yyyyMMddHHmmss"}) ++ "-" ++ (randomInt(10000) as String),
+                        response: {
+                            id: "MOCK-" ++ (now() as String {format: "yyyyMMddHHmmss"}),
+                            description: payload.description default "Mock Batch",
+                            status: "Pending",
+                            total_entries: sizeOf(payload.journal_entries default [])
+                        },
+                        mock: true,
+                        timestamp: now() as String {format: "yyyy-MM-dd'T'HH:mm:ssZ"}
+                    }]]>
+                </ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </sub-flow>
+
+    <!-- ========================================================================= -->
+    <!-- Retry With Backoff                                                        -->
+    <!-- ========================================================================= -->
+
+    <sub-flow name="Retry-With-Backoff">
+        <description>
+            Retries the API request with exponential backoff.
+            Configurable via retry.count and retry.delay.ms properties.
+        </description>
+
+        <logger level="WARN" message="Retrying SKY API request. Attempt: #[vars.retryCount default 0]"/>
+
+        <set-variable value="#[(vars.retryCount default 0) + 1]" variableName="retryCount"/>
+
+        <choice>
+            <when expression="#[vars.retryCount <= p('sky.api.retry.count') as Number default 3]">
+                <!-- Exponential backoff: delay * 2^attempt -->
+                <scripting:execute engine="groovy">
+                    <scripting:code><![CDATA[
+                        def baseDelay = Integer.parseInt(muleContext.getConfiguration().getProperty("sky.api.retry.delay.ms", "1000"));
+                        def attempt = vars.retryCount;
+                        def delay = baseDelay * Math.pow(2, attempt - 1);
+                        java.lang.Thread.sleep(delay as long);
+                    ]]></scripting:code>
+                </scripting:execute>
+
+                <flow-ref name="Submit-To-SKY-API"/>
+            </when>
+            <otherwise>
+                <logger level="ERROR" message="Max retry attempts reached (${p('sky.api.retry.count')}). Giving up."/>
+                <set-payload value="#[{status: 'FAILED', errorType: 'MAX_RETRIES_EXCEEDED', errorMessage: 'Max retry attempts reached'}]"/>
+            </otherwise>
+        </choice>
+    </sub-flow>
+
+    <!-- ========================================================================= -->
+    <!-- Get Journal Entry Batch Status                                           -->
+    <!-- ========================================================================= -->
+
+    <sub-flow name="Get-Batch-Status">
+        <description>
+            Retrieves the status of a journal entry batch from SKY API.
+            
+            REQUIRES CLIENT CONFIRMATION: Confirm endpoint path.
+        </description>
+
+        <flow-ref name="Get-OAuth-Token-Sub-Flow"/>
+        <set-variable value="#[payload]" variableName="bearerToken"/>
+
+        <http:request method="GET"
+                       config-ref="SKY-API-HTTP-Config"
+                       path="/fe/general-ledger/journalentrybatches/$(batchId)">
+            <http:headers>#[
+                {
+                    "Authorization": "Bearer $(vars.bearerToken)",
+                    "Bb-Api-Subscription-Key": p("sky.api.subscription.key")
+                }
+            ]</http:headers>
+        </http:request>
+    </sub-flow>
+
+</mule>

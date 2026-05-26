@@ -1,0 +1,228 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:file="http://www.mulesoft.org/schema/mule/file"
+      xmlns:dw="http://www.mulesoft.org/schema/mule/ee/dw"
+      xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+        http://www.mulesoft.org/schema/mule/file http://www.mulesoft.org/schema/mule/file/current/mule-file.xsd
+        http://www.mulesoft.org/schema/mule/ee/dw http://www.mulesoft.org/schema/mule/ee/dw/current/dw.xsd
+        http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/ee.xsd">
+
+    <!-- ========================================================================= -->
+    <!-- Experience API Layer                                                      -->
+    <!-- ========================================================================= -->
+    <!--
+        Entry point for the GL CSV integration.
+        
+        Endpoints:
+        - POST /api/v1/gl/process         Process a CSV payload inline
+        - POST /api/v1/gl/process/file    Process a CSV file from specified path
+        - GET  /api/v1/gl/status/{id}     Check processing status
+        - GET  /api/v1/gl/health          Health check
+        
+        Accepts CSV content and returns processing results.
+    ========================================================================= -->
+
+    <!-- ========================================================================= -->
+    <!-- POST /api/v1/gl/process - Process CSV Payload                            -->
+    <!-- ========================================================================= -->
+
+    <flow name="Process-CSV-From-Payload">
+        <description>
+            Accepts a CSV payload in the request body and triggers
+            the GL integration processing pipeline.
+            
+            Input: CSV content as text or multipart file
+            Output: Processing summary JSON
+        </description>
+
+        <http:listener config-ref="HTTP-Listener-Config"
+                        path="${http.basePath}/process"
+                        allowedMethods="POST">
+            <http:response statusCode="200">
+                <http:headers>#["Content-Type": "application/json"]</http:headers>
+            </http:response>
+            <http:error-response statusCode="500">
+                <http:headers>#["Content-Type": "application/json"]</http:headers>
+            </http:error-response>
+        </http:listener>
+
+        <logger level="INFO" message="Received CSV processing request. Content-Type: #[attributes.headers.'Content-Type']"/>
+
+        <try>
+            <!-- Extract CSV content from request -->
+            <choice>
+                <when expression="#[attributes.headers.'Content-Type' contains 'multipart/form-data']">
+                    <!-- Handle file upload -->
+                    <ee:transform>
+                        <ee:message>
+                            <ee:set-payload>
+                                <![CDATA[%dw 2.0
+                                output text/plain
+                                ---
+                                payload.parts.file.content as String]]>
+                            </ee:set-payload>
+                        </ee:message>
+                    </ee:transform>
+                </when>
+                <otherwise>
+                    <!-- Handle raw CSV body -->
+                    <ee:transform>
+                        <ee:message>
+                            <ee:set-payload>
+                                <![CDATA[%dw 2.0
+                                output text/plain
+                                ---
+                                payload as String]]>
+                            </ee:set-payload>
+                        </ee:message>
+                    </ee:transform>
+                </otherwise>
+            </choice>
+
+            <!-- Trigger the main processing flow -->
+            <flow-ref name="Process-GL-Integration-Flow"/>
+
+        </try>
+        <error-handler>
+            <on-error-continue type="ANY">
+                <logger level="ERROR" message="CSV processing request failed: #[error.description]"/>
+                <set-payload value='#[
+                    {
+                        status: "ERROR",
+                        errorMessage: error.description,
+                        timestamp: now() as String {format: "yyyy-MM-dd\'T\'HH:mm:ssZ"}
+                    }
+                ]'/>
+            </on-error-continue>
+        </error-handler>
+    </flow>
+
+    <!-- ========================================================================= -->
+    <!-- POST /api/v1/gl/process/file - Process CSV from File                     -->
+    <!-- ========================================================================= -->
+
+    <flow name="Process-CSV-From-File">
+        <description>
+            Triggers processing of a CSV file from the configured input directory.
+            Useful for scheduled/batch processing.
+        </description>
+
+        <http:listener config-ref="HTTP-Listener-Config"
+                        path="${http.basePath}/process/file"
+                        allowedMethods="POST">
+            <http:response statusCode="202">
+                <http:headers>#["Content-Type": "application/json"]</http:headers>
+            </http:response>
+        </http:listener>
+
+        <logger level="INFO" message="Received file processing request. Processing CSV files from: ${csv.input.directory}"/>
+
+        <try>
+            <file:list config-ref="File-Input-Config" directoryPath="${csv.input.directory}">
+                <file:matcher pattern="${csv.file.pattern}"/>
+            </file:list>
+
+            <foreach>
+                <set-variable value="#[payload.path]" variableName="currentFilePath"/>
+                <set-variable value="#[payload.name]" variableName="currentFileName"/>
+
+                <file:read config-ref="File-Input-Config" path="#[vars.currentFilePath]"/>
+                <set-payload value="#[payload as String]"/>
+
+                <!-- Trigger the main processing flow -->
+                <flow-ref name="Process-GL-Integration-Flow"/>
+
+                <!-- Archive processed file -->
+                <file:copy config-ref="File-Input-Config"
+                           directory="#[p('csv.archive.directory')]"
+                           path="#[vars.currentFilePath]">
+                    <file:rename-to value="#[vars.currentFileName ++ '.processed.' ++ (now() as String {format: 'yyyyMMddHHmmss'})]"/>
+                </file:copy>
+
+                <logger level="INFO" message="File processed and archived: #[vars.currentFilePath]"/>
+            </foreach>
+
+            <set-payload value='#[
+                {
+                    status: "ACCEPTED",
+                    message: "File processing initiated",
+                    timestamp: now() as String {format: "yyyy-MM-dd\'T\'HH:mm:ssZ"}
+                }
+            ]'/>
+
+        </try>
+        <error-handler>
+            <on-error-continue type="ANY">
+                <logger level="ERROR" message="File processing failed: #[error.description]"/>
+                <set-payload value='#[
+                    {
+                        status: "ERROR",
+                        errorMessage: error.description,
+                        timestamp: now() as String {format: "yyyy-MM-dd\'T\'HH:mm:ssZ"}
+                    }
+                ]'/>
+            </on-error-continue>
+        </error-handler>
+    </flow>
+
+    <!-- ========================================================================= -->
+    <!-- GET /api/v1/gl/status/{id} - Check Processing Status                     -->
+    <!-- ========================================================================= -->
+
+    <flow name="Get-Processing-Status">
+        <description>
+            Returns the processing status for a given transaction ID.
+            Placeholder - requires persistent storage integration.
+        </description>
+
+        <http:listener config-ref="HTTP-Listener-Config"
+                        path="${http.basePath}/status/{id}"
+                        allowedMethods="GET">
+            <http:response statusCode="200">
+                <http:headers>#["Content-Type": "application/json"]</http:headers>
+            </http:response>
+        </http:listener>
+
+        <set-payload value='#[
+            {
+                status: "PLACEHOLDER",
+                transactionId: attributes.uriParams.id,
+                message: "Status lookup requires persistent storage integration",
+                timestamp: now() as String {format: "yyyy-MM-dd\'T\'HH:mm:ssZ"}
+            }
+        ]'/>
+    </flow>
+
+    <!-- ========================================================================= -->
+    <!-- GET /api/v1/gl/health - Health Check                                    -->
+    <!-- ========================================================================= -->
+
+    <flow name="Health-Check">
+        <description>Health check endpoint for monitoring</description>
+
+        <http:listener config-ref="HTTP-Listener-Config"
+                        path="${http.basePath}/health"
+                        allowedMethods="GET">
+            <http:response statusCode="200">
+                <http:headers>#["Content-Type": "application/json"]</http:headers>
+            </http:response>
+        </http:listener>
+
+        <set-payload value='#[
+            {
+                status: "UP",
+                service: "MuleSoft GL Integration",
+                version: "1.0.0",
+                environment: p("environment"),
+                mockMode: p("sky.api.mock.enabled"),
+                timestamp: now() as String {format: "yyyy-MM-dd\'T\'HH:mm:ssZ"}
+            }
+        ]'/>
+    </flow>
+
+</mule>

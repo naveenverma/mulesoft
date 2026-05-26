@@ -1,0 +1,195 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:os="http://www.mulesoft.org/schema/mule/objectstore"
+      xmlns:dw="http://www.mulesoft.org/schema/mule/ee/dw"
+      xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+        http://www.mulesoft.org/schema/mule/objectstore http://www.mulesoft.org/schema/mule/objectstore/current/mule-objectstore.xsd
+        http://www.mulesoft.org/schema/mule/ee/dw http://www.mulesoft.org/schema/mule/ee/dw/current/dw.xsd
+        http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/ee.xsd">
+
+    <!-- ========================================================================= -->
+    <!-- Authentication Flow                                                      -->
+    <!-- ========================================================================= -->
+    <!--
+        Manages OAuth 2.0 client credentials flow for Blackbaud SKY API.
+        Caches active tokens in ObjectStore and auto-refreshes expired tokens.
+        
+        REQUIRES CLIENT CONFIRMATION:
+        - Confirm grant type (client_credentials vs authorization_code)
+        - Confirm scope parameter requirements
+        - Confirm refresh token handling for authorization_code flow
+    ========================================================================= -->
+
+    <flow name="Get-OAuth-Token-Sub-Flow">
+        <description>
+            Retrieves a valid OAuth 2.0 access token.
+            Returns cached token if still valid, otherwise refreshes.
+        </description>
+
+        <!-- Check ObjectStore for valid cached token -->
+        <try>
+            <os:retrieve key="skyApiAccessToken" target="cachedToken"
+                          config-ref="Token-ObjectStore">
+                <os:default-value>#[""]</os:default-value>
+            </os:retrieve>
+
+            <choice>
+                <when expression="#[vars.cachedToken != '' and vars.cachedToken != null]">
+                    <!-- Return cached token -->
+                    <logger level="DEBUG" message="Using cached SKY API access token"/>
+                    <set-payload value="#[vars.cachedToken]"/>
+                </when>
+                <otherwise>
+                    <!-- No valid token cached, request a new one -->
+                    <flow-ref name="Request-New-OAuth-Token"/>
+                </otherwise>
+            </choice>
+        </try>
+        <error-handler>
+            <on-error-continue type="ANY">
+                <!-- If ObjectStore retrieval fails, request new token -->
+                <logger level="WARN" message="Token cache miss or error: #[error.description]"/>
+                <flow-ref name="Request-New-OAuth-Token"/>
+            </on-error-continue>
+        </error-handler>
+    </flow>
+
+    <!-- ========================================================================= -->
+    <!-- Request New OAuth Token                                                  -->
+    <!-- ========================================================================= -->
+
+    <sub-flow name="Request-New-OAuth-Token">
+        <description>
+            Requests a new OAuth 2.0 access token from Blackbaud SKY API
+            using client credentials grant type.
+        </description>
+
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload>
+                    <![CDATA[%dw 2.0
+                    output application/x-www-form-urlencoded
+                    ---
+                    {
+                        grant_type: "client_credentials",
+                        client_id: p("sky.api.client.id"),
+                        client_secret: p("sky.api.client.secret")
+                    }]]>
+                </ee:set-payload>
+            </ee:message>
+        </ee:transform>
+
+        <http:request method="POST"
+                       config-ref="SKY-OAuth-HTTP-Config"
+                       path="/token">
+            <http:headers>#[
+                {
+                    "Content-Type": "application/x-www-form-urlencoded"
+                }
+            ]</http:headers>
+        </http:request>
+
+        <!-- Extract and cache the access token -->
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload>
+                    <![CDATA[%dw 2.0
+                    output application/json
+                    ---
+                    {
+                        accessToken: payload.access_token,
+                        tokenType: payload.token_type,
+                        expiresIn: payload.expires_in,
+                        refreshToken: payload.refresh_token default null,
+                        scope: payload.scope default null,
+                        retrievedAt: now() as String {format: "yyyy-MM-dd'T'HH:mm:ssZ"}
+                    }]]>
+                </ee:set-payload>
+            </ee:message>
+        </ee:transform>
+
+        <!-- Store token in ObjectStore -->
+        <os:store key="skyApiAccessToken" config-ref="Token-ObjectStore">
+            <os:value>#[
+                payload.accessToken
+            ]</os:value>
+        </os:store>
+
+        <logger level="INFO" message="New SKY API OAuth token acquired. Expires in: #[payload.expiresIn] seconds"/>
+    </sub-flow>
+
+    <!-- ========================================================================= -->
+    <!-- Refresh Token (for authorization_code flow)                               -->
+    <!-- ========================================================================= -->
+
+    <sub-flow name="Refresh-OAuth-Token">
+        <description>
+            Refreshes an expired OAuth token using the refresh token.
+            Only applicable for authorization_code grant type.
+        </description>
+
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload>
+                    <![CDATA[%dw 2.0
+                    output application/x-www-form-urlencoded
+                    ---
+                    {
+                        grant_type: "refresh_token",
+                        client_id: p("sky.api.client.id"),
+                        client_secret: p("sky.api.client.secret"),
+                        refresh_token: p("sky.api.refresh.token")
+                    }]]>
+                </ee:set-payload>
+            </ee:message>
+        </ee:transform>
+
+        <http:request method="POST"
+                       config-ref="SKY-OAuth-HTTP-Config"
+                       path="/token">
+            <http:headers>#[
+                {
+                    "Content-Type": "application/x-www-form-urlencoded"
+                }
+            ]</http:headers>
+        </http:request>
+
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload>
+                    <![CDATA[%dw 2.0
+                    output application/json
+                    ---
+                    {
+                        accessToken: payload.access_token,
+                        tokenType: payload.token_type,
+                        expiresIn: payload.expires_in,
+                        refreshToken: payload.refresh_token default null,
+                        retrievedAt: now() as String {format: "yyyy-MM-dd'T'HH:mm:ssZ"}
+                    }]]>
+                </ee:set-payload>
+            </ee:message>
+        </ee:transform>
+
+        <os:store key="skyApiAccessToken" config-ref="Token-ObjectStore">
+            <os:value>#[
+                payload.accessToken
+            ]</os:value>
+        </os:store>
+
+        <!-- Also store new refresh token if returned -->
+        <os:store key="skyApiRefreshToken" config-ref="Token-ObjectStore">
+            <os:value>#[
+                payload.refreshToken
+            ]</os:value>
+        </os:store>
+
+        <logger level="INFO" message="SKY API OAuth token refreshed successfully"/>
+    </sub-flow>
+
+</mule>

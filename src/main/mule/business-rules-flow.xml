@@ -1,0 +1,319 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xmlns:dw="http://www.mulesoft.org/schema/mule/ee/dw"
+      xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/ee/dw http://www.mulesoft.org/schema/mule/ee/dw/current/dw.xsd
+        http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/ee.xsd">
+
+    <!-- ========================================================================= -->
+    <!-- Business Rules Layer                                                      -->
+    <!-- ========================================================================= -->
+    <!--
+        Configurable business rules applied to each CSV record before
+        transformation.
+        
+        Rules are configured in business-rules.properties.
+        All rules can be enabled/disabled via configuration.
+        
+        Current Rules:
+        1. Amount <= threshold → REJECT
+        2. Missing Journal → assign DEFAULT_JOURNAL
+        3. Invalid Account → ERROR_QUEUE
+        4. Date conversion: MM/dd/yyyy → yyyy-MM-dd
+        5. Null handling → OMIT_FIELD or EMPTY_STRING
+        6. String trimming
+        7. Safe numeric conversion
+    ========================================================================= -->
+
+    <sub-flow name="Apply-Business-Rules-Sub-Flow">
+        <description>
+            Applies all configured business rules to a parsed CSV record.
+            Returns the validated/enriched record with a status indicator.
+        </description>
+
+        <flow-ref name="Rule-Validate-Amount"/>
+        <flow-ref name="Rule-Default-Journal"/>
+        <flow-ref name="Rule-Validate-Account"/>
+        <flow-ref name="Rule-Convert-Dates"/>
+        <flow-ref name="Rule-Handle-Nulls"/>
+        <flow-ref name="Rule-Trim-Strings"/>
+        <flow-ref name="Rule-Convert-Numerics"/>
+
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload>
+                    <![CDATA[%dw 2.0
+                    output application/json
+                    ---
+                    payload
+                    ]]>
+                </ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </sub-flow>
+
+    <!-- ========================================================================= -->
+    <!-- Rule 1: Amount Validation                                                 -->
+    <!-- ========================================================================= -->
+
+    <sub-flow name="Rule-Validate-Amount">
+        <description>
+            Rule 1: Reject records where Amount <= configured threshold.
+            Configurable via rule.amount.rejection.enabled and rule.amount.rejection.threshold.
+        </description>
+
+        <choice>
+            <when expression="#[p('rule.amount.rejection.enabled') == 'true']">
+                <try>
+                    <ee:transform>
+                        <ee:message>
+                            <ee:set-payload>
+                                <![CDATA[%dw 2.0
+                                output application/json
+                                ---
+                                payload ++ {
+                                    amountValid: (
+                                        (payload.Amount default "0") as Number default 0
+                                        > 
+                                        (p('rule.amount.rejection.threshold') default "0") as Number default 0
+                                    )
+                                }]]>
+                            </ee:set-payload>
+                        </ee:message>
+                    </ee:transform>
+
+                    <choice>
+                        <when expression="#[!payload.amountValid]">
+                            <logger level="WARN" message="RULE 1: Record rejected - Amount (${payload.Amount}) <= threshold"/>
+                            <set-payload value="#[payload ++ {rejectionReason: 'AMOUNT_THRESHOLD'}]"/>
+                            <flow-ref name="Route-Rejected-Record"/>
+                        </when>
+                    </choice>
+                </try>
+                <error-handler>
+                    <on-error-continue type="ANY">
+                        <logger level="ERROR" message="RULE 1 Error: Amount validation failed - #[error.description]"/>
+                    </on-error-continue>
+                </error-handler>
+            </when>
+        </choice>
+    </sub-flow>
+
+    <!-- ========================================================================= -->
+    <!-- Rule 2: Default Journal                                                   -->
+    <!-- ========================================================================= -->
+
+    <sub-flow name="Rule-Default-Journal">
+        <description>
+            Rule 2: Assign default journal when Journal field is missing.
+            Configurable via rule.journal.default.enabled and rule.journal.default.value.
+        </description>
+
+        <choice>
+            <when expression="#[p('rule.journal.default.enabled') == 'true' and (payload.Journal == null or payload.Journal == '')]">
+                <ee:transform>
+                    <ee:message>
+                        <ee:set-payload>
+                            <![CDATA[%dw 2.0
+                            output application/json
+                            ---
+                            payload ++ {
+                                Journal: p('rule.journal.default.value') default "DEFAULT_JOURNAL"
+                            }]]>
+                        </ee:set-payload>
+                    </ee:message>
+                </ee:transform>
+                <logger level="INFO" message="RULE 2: Assigned default journal to record with ReferenceNumber: #[payload.ReferenceNumber]"/>
+            </when>
+        </choice>
+    </sub-flow>
+
+    <!-- ========================================================================= -->
+    <!-- Rule 3: Account Validation                                                -->
+    <!-- ========================================================================= -->
+
+    <sub-flow name="Rule-Validate-Account">
+        <description>
+            Rule 3: Validate account numbers. Invalid accounts sent to error queue.
+            Configurable via rule.account.validation.enabled.
+            An account is considered invalid if empty or contains special characters.
+        </description>
+
+        <choice>
+            <when expression="#[p('rule.account.validation.enabled') == 'true']">
+                <try>
+                    <ee:transform>
+                        <ee:message>
+                            <ee:set-payload>
+                                <![CDATA[%dw 2.0
+                                output application/json
+                                ---
+                                payload ++ {
+                                    accountErrors: flatten([
+                                        if (isEmpty(payload.CreditAccountNumber))
+                                            ["CreditAccountNumber is empty"]
+                                        else if (!(payload.CreditAccountNumber matches /^[A-Za-z0-9\-_]+$/))
+                                            ["CreditAccountNumber '$(payload.CreditAccountNumber)' contains invalid characters"]
+                                        else null,
+                                        if (isEmpty(payload.DebitAccountNumber))
+                                            ["DebitAccountNumber is empty"]
+                                        else if (!(payload.DebitAccountNumber matches /^[A-Za-z0-9\-_]+$/))
+                                            ["DebitAccountNumber '$(payload.DebitAccountNumber)' contains invalid characters"]
+                                        else null
+                                    ])
+                                }]]>
+                            </ee:set-payload>
+                        </ee:message>
+                    </ee:transform>
+
+                    <choice>
+                        <when expression="#[sizeOf(payload.accountErrors default []) > 0]">
+                            <logger level="WARN" message="RULE 3: Account validation errors: #[payload.accountErrors]"/>
+                            <set-variable value="#[payload ++ {rejectionReason: 'INVALID_ACCOUNT'}]" variableName="rejectedRecord"/>
+                            <flow-ref name="Route-Error-Queue"/>
+                        </when>
+                    </choice>
+                </try>
+                <error-handler>
+                    <on-error-continue type="ANY">
+                        <logger level="ERROR" message="RULE 3 Error: Account validation failed - #[error.description]"/>
+                    </on-error-continue>
+                </error-handler>
+            </when>
+        </choice>
+    </sub-flow>
+
+    <!-- ========================================================================= -->
+    <!-- Rule 4: Date Format Conversion                                            -->
+    <!-- ========================================================================= -->
+
+    <sub-flow name="Rule-Convert-Dates">
+        <description>
+            Rule 4: Convert dates from input format to output format.
+            Configurable via rule.date.input.format and rule.date.output.format.
+        </description>
+
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload>
+                    <![CDATA[%dw 2.0
+                    output application/json
+                    ---
+                    payload ++ {
+                        TransactionDate: if (isEmpty(payload.TransactionDate)) null
+                            else (
+                                (payload.TransactionDate as String) as Date {format: p('rule.date.input.format') default "MM/dd/yyyy"}
+                            ) as String {format: p('rule.date.output.format') default "yyyy-MM-dd"}
+                    }]]>
+                </ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </sub-flow>
+
+    <!-- ========================================================================= -->
+    <!-- Rule 5: Null Handling                                                    -->
+    <!-- ========================================================================= -->
+
+    <sub-flow name="Rule-Handle-Nulls">
+        <description>
+            Rule 5: Handle null values based on configured action.
+            Configurable via rule.null.handling.action.
+            Options: OMIT_FIELD, EMPTY_STRING, DEFAULT_VALUE
+        </description>
+
+        <choice>
+            <when expression="#[p('rule.null.handling.action') == 'EMPTY_STRING']">
+                <ee:transform>
+                    <ee:message>
+                        <ee:set-payload>
+                            <![CDATA[%dw 2.0
+                            output application/json
+                            ---
+                            payload mapObject ((value, key, index) ->
+                                if (value == null) "" else value
+                            )]]>
+                        </ee:set-payload>
+                    </ee:message>
+                </ee:transform>
+            </when>
+        </choice>
+    </sub-flow>
+
+    <!-- ========================================================================= -->
+    <!-- Rule 6: String Trimming                                                  -->
+    <!-- ========================================================================= -->
+
+    <sub-flow name="Rule-Trim-Strings">
+        <description>
+            Rule 6: Trim whitespace from all string fields.
+            Configurable via rule.trim.strings.enabled.
+        </description>
+
+        <choice>
+            <when expression="#[p('rule.trim.strings.enabled') == 'true']">
+                <ee:transform>
+                    <ee:message>
+                        <ee:set-payload>
+                            <![CDATA[%dw 2.0
+                            output application/json
+                            ---
+                            payload mapObject ((value, key, index) ->
+                                value match {
+                                    case is String -> value trim
+                                    else -> value
+                                }
+                            )]]>
+                        </ee:set-payload>
+                    </ee:message>
+                </ee:transform>
+            </when>
+        </choice>
+    </sub-flow>
+
+    <!-- ========================================================================= -->
+    <!-- Rule 7: Safe Numeric Conversion                                          -->
+    <!-- ========================================================================= -->
+
+    <sub-flow name="Rule-Convert-Numerics">
+        <description>
+            Rule 7: Safely convert amount fields to numeric values.
+            Configurable via rule.numeric.safe.conversion.enabled.
+        </description>
+
+        <choice>
+            <when expression="#[p('rule.numeric.safe.conversion.enabled') == 'true']">
+                <ee:transform>
+                    <ee:message>
+                        <ee:set-payload>
+                            <![CDATA[%dw 2.0
+                            output application/json
+                            ---
+                            payload ++ {
+                                Amount: try (payload.Amount as Number) catch (e) (p('rule.numeric.default.value') default "0") as Number,
+                                Payment: if (!isEmpty(payload.Payment)) try (payload.Payment as Number) catch (e) null else null
+                            }]]>
+                        </ee:set-payload>
+                    </ee:message>
+                </ee:transform>
+            </when>
+        </choice>
+    </sub-flow>
+
+    <!-- ========================================================================= -->
+    <!-- Routing Flows                                                             -->
+    <!-- ========================================================================= -->
+
+    <sub-flow name="Route-Rejected-Record">
+        <description>Sends rejected records to the error handling flow</description>
+        <flow-ref name="Handle-Rejected-Record"/>
+    </sub-flow>
+
+    <sub-flow name="Route-Error-Queue">
+        <description>Sends records with validation errors to the error queue</description>
+        <flow-ref name="Handle-Error-Queue-Record"/>
+    </sub-flow>
+
+</mule>

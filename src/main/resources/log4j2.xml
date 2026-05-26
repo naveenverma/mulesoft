@@ -1,0 +1,82 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Configuration status="WARN" name="mule-gl-integration">
+    <Properties>
+        <Property name="log.pattern">%d{yyyy-MM-dd HH:mm:ss.SSS} [%t] %-5p %c{1} - %m%n</Property>
+        <Property name="log.structured.pattern">{"timestamp":"%d{yyyy-MM-dd'T'HH:mm:ss.SSSZ}","thread":"%t","level":"%-5p","logger":"%c{1}","message":"%m","transactionId":"%X{transactionId}","sourceRecordId":"%X{sourceRecordId}"}%n</Property>
+        <Property name="log.dir">${sys:mule.home}/logs</Property>
+    </Properties>
+
+    <Appenders>
+        <Console name="Console" target="SYSTEM_OUT">
+            <PatternLayout pattern="${log.pattern}"/>
+        </Console>
+
+        <RollingFile name="IntegrationLog"
+                     fileName="${log.dir}/gl-integration.log"
+                     filePattern="${log.dir}/gl-integration-%d{yyyy-MM-dd}-%i.log.gz">
+            <PatternLayout pattern="${log.structured.pattern}"/>
+            <Policies>
+                <TimeBasedTriggeringPolicy/>
+                <SizeBasedTriggeringPolicy size="50MB"/>
+            </Policies>
+            <DefaultRolloverStrategy max="30">
+                <Delete basePath="${log.dir}" maxDepth="1">
+                    <IfFileName glob="gl-integration-*.log.gz"/>
+                    <IfLastModified age="30d"/>
+                </Delete>
+            </DefaultRolloverStrategy>
+        </RollingFile>
+
+        <RollingFile name="ErrorLog"
+                     fileName="${log.dir}/gl-integration-error.log"
+                     filePattern="${log.dir}/gl-integration-error-%d{yyyy-MM-dd}-%i.log.gz">
+            <PatternLayout pattern="${log.structured.pattern}"/>
+            <Policies>
+                <TimeBasedTriggeringPolicy/>
+                <SizeBasedTriggeringPolicy size="50MB"/>
+            </Policies>
+            <DefaultRolloverStrategy max="30"/>
+        </RollingFile>
+
+        <RollingFile name="AuditLog"
+                     fileName="${log.dir}/gl-integration-audit.log"
+                     filePattern="${log.dir}/gl-integration-audit-%d{yyyy-MM-dd}-%i.log.gz">
+            <PatternLayout pattern="${log.structured.pattern}"/>
+            <Policies>
+                <TimeBasedTriggeringPolicy/>
+                <SizeBasedTriggeringPolicy size="50MB"/>
+            </Policies>
+            <DefaultRolloverStrategy max="90"/>
+        </RollingFile>
+    </Appenders>
+
+    <Loggers>
+        <!-- Application Logger -->
+        <Logger name="com.mulesoft.integration" level="DEBUG" additivity="false">
+            <AppenderRef ref="IntegrationLog"/>
+            <AppenderRef ref="Console"/>
+        </Logger>
+
+        <!-- Error Logger -->
+        <Logger name="com.mulesoft.integration.error" level="ERROR" additivity="false">
+            <AppenderRef ref="ErrorLog"/>
+            <AppenderRef ref="Console"/>
+        </Logger>
+
+        <!-- Audit Logger -->
+        <Logger name="com.mulesoft.integration.audit" level="INFO" additivity="false">
+            <AppenderRef ref="AuditLog"/>
+        </Logger>
+
+        <!-- Mule HTTP Logger -->
+        <Logger name="org.mule.service.http" level="WARN" additivity="false">
+            <AppenderRef ref="IntegrationLog"/>
+        </Logger>
+
+        <!-- Root Logger -->
+        <Root level="INFO">
+            <AppenderRef ref="Console"/>
+            <AppenderRef ref="IntegrationLog"/>
+        </Root>
+    </Loggers>
+</Configuration>

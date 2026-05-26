@@ -1,0 +1,286 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xmlns:file="http://www.mulesoft.org/schema/mule/file"
+      xmlns:dw="http://www.mulesoft.org/schema/mule/ee/dw"
+      xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+      xmlns:os="http://www.mulesoft.org/schema/mule/objectstore"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/file http://www.mulesoft.org/schema/mule/file/current/mule-file.xsd
+        http://www.mulesoft.org/schema/mule/ee/dw http://www.mulesoft.org/schema/mule/ee/dw/current/dw.xsd
+        http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/ee.xsd
+        http://www.mulesoft.org/schema/mule/objectstore http://www.mulesoft.org/schema/mule/objectstore/current/mule-objectstore.xsd">
+
+    <!-- ========================================================================= -->
+    <!-- Process API Layer                                                         -->
+    <!-- ========================================================================= -->
+    <!--
+        Orchestrates the core processing pipeline:
+        
+        CSV Input → Read CSV → Validate Fields → Apply Business Rules
+        → DataWeave Transformation → Generate Payload → Submit to System API
+        → Capture Response → Log Results → Return Status
+        
+        Batch processing: processes records in configurable batch sizes.
+    ========================================================================= -->
+
+    <!-- ========================================================================= -->
+    <!-- Main Processing Flow (triggered by Experience API)                       -->
+    <!-- ========================================================================= -->
+
+    <flow name="Process-GL-Integration-Flow">
+        <description>
+            Main processing pipeline for GL CSV integration.
+            Accepts parsed CSV records, applies rules, transforms,
+            and submits to SKY API.
+        </description>
+
+        <try>
+            <!-- Step 1: Generate Transaction ID -->
+            <set-variable value="#[java.util.UUID.randomUUID()]" variableName="transactionId"/>
+
+            <!-- Step 2: Parse CSV input -->
+            <flow-ref name="Parse-CSV-Flow"/>
+
+            <logger level="INFO" message="[${vars.transactionId}] CSV parsed successfully. Records: #[sizeOf(payload)]"/>
+
+            <!-- Step 3: Validate records -->
+            <flow-ref name="Validate-CSV-Records-Flow"/>
+            <set-variable value="#[payload.valid]" variableName="validRecords"/>
+            <set-variable value="#[payload.rejected]" variableName="rejectedRecords"/>
+
+            <logger level="INFO" message="[${vars.transactionId}] Validation complete. Valid: #[sizeOf(vars.validRecords)], Rejected: #[sizeOf(vars.rejectedRecords default [])]"/>
+
+            <!-- Step 4: Apply business rules to valid records -->
+            <flow-ref name="Apply-Business-Rules-Batch-Flow"/>
+            <set-variable value="#[payload]" variableName="enrichedRecords"/>
+
+            <!-- Step 5: Transform to SKY API payload -->
+            <flow-ref name="Transform-To-SKY-Payload-Flow"/>
+
+            <!-- Step 6: Submit to SKY API via System API layer -->
+            <flow-ref name="Send-Journal-Entry-Batch-Sub-Flow"/>
+
+            <!-- Step 7: Log results -->
+            <flow-ref name="Log-Processing-Result-Flow"/>
+
+            <!-- Step 8: Return processing summary -->
+            <flow-ref name="Generate-Processing-Summary"/>
+
+        </try>
+        <error-handler>
+            <on-error-continue type="ANY">
+                <logger level="ERROR" message="[${vars.transactionId}] Processing failed: #[error.description]"/>
+                <flow-ref name="Log-Error-Flow"/>
+                <set-payload value="#[{
+                    status: 'FAILED',
+                    transactionId: vars.transactionId,
+                    errorMessage: error.description,
+                    timestamp: now() as String {format: "yyyy-MM-dd'T'HH:mm:ssZ"}
+                }]"/>
+            </on-error-continue>
+        </error-handler>
+    </flow>
+
+    <!-- ========================================================================= -->
+    <!-- Parse CSV Records                                                         -->
+    <!-- ========================================================================= -->
+
+    <sub-flow name="Parse-CSV-Flow">
+        <description>
+            Parses the incoming CSV payload into an array of records.
+            Uses Mule's DataWeave CSV parsing capabilities.
+            Fields are dynamically detected from the CSV header row.
+        </description>
+
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload>
+                    <![CDATA[%dw 2.0
+                    output application/json
+                    ---
+                    payload match {
+                        case is Array -> payload  // Already parsed
+                        case is String -> 
+                            payload readCsv using {
+                                header: true,
+                                separator: ",",
+                                quote: "\"",
+                                escape: "\\"
+                            } map ((row) -> {
+                                // Dynamically map all fields from CSV headers
+                                // Type inference: attempt numeric conversion where applicable
+                                ($) mapObject ((value, key, index) -> {
+                                    (key): value match {
+                                        // Attempt to detect numeric fields
+                                        case s: String if (s matches /^-?\d+(\.\d+)?$/) -> s as Number
+                                        else -> s
+                                    }
+                                })
+                            })
+                        else -> []
+                    }]]>
+                </ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </sub-flow>
+
+    <!-- ========================================================================= -->
+    <!-- Validate CSV Records                                                      -->
+    <!-- ========================================================================= -->
+
+    <sub-flow name="Validate-CSV-Records-Flow">
+        <description>
+            Validates CSV records for mandatory fields and basic integrity.
+            Splits into valid and rejected records.
+        </description>
+
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload>
+                    <![CDATA[%dw 2.0
+                    output application/json
+                    ---
+                    // Dynamically extract field names from the first record
+                    var fieldNames = if (isEmpty(payload)) [] else (payload[0] pluck $$)
+                    ---
+                    {
+                        // Detect mandatory fields heuristically
+                        allFields: fieldNames,
+                        valid: payload filter ((record) ->
+                            !isEmpty(record.Amount) and
+                            !isEmpty(record.CreditAccountNumber) and
+                            !isEmpty(record.DebitAccountNumber) and
+                            !isEmpty(record.Description)
+                        ),
+                        rejected: payload filter ((record) ->
+                            isEmpty(record.Amount) or
+                            isEmpty(record.CreditAccountNumber) or
+                            isEmpty(record.DebitAccountNumber) or
+                            isEmpty(record.Description)
+                        ) map ((record) ->
+                            record ++ {
+                                rejectionReason: "MISSING_MANDATORY_FIELD",
+                                missingFields: flatten([
+                                    if (isEmpty(record.Amount)) "Amount" else null,
+                                    if (isEmpty(record.CreditAccountNumber)) "CreditAccountNumber" else null,
+                                    if (isEmpty(record.DebitAccountNumber)) "DebitAccountNumber" else null,
+                                    if (isEmpty(record.Description)) "Description" else null
+                                ])
+                            }
+                        ),
+                        summary: {
+                            totalRecords: sizeOf(payload),
+                            validCount: sizeOf(payload filter ((record) ->
+                                !isEmpty(record.Amount) and
+                                !isEmpty(record.CreditAccountNumber) and
+                                !isEmpty(record.DebitAccountNumber) and
+                                !isEmpty(record.Description)
+                            )),
+                            rejectedCount: sizeOf(payload filter ((record) ->
+                                isEmpty(record.Amount) or
+                                isEmpty(record.CreditAccountNumber) or
+                                isEmpty(record.DebitAccountNumber) or
+                                isEmpty(record.Description)
+                            ))
+                        }
+                    }]]>
+                </ee:set-payload>
+            </ee:message>
+        </ee:transform>
+
+        <!-- Log validation summary -->
+        <logger level="INFO" message="Validation: #[payload.summary.totalRecords] total, #[payload.summary.validCount] valid, #[payload.summary.rejectedCount] rejected"/>
+
+        <!-- Route rejected records to error handling -->
+        <choice>
+            <when expression="#[sizeOf(payload.rejected) > 0]">
+                <logger level="WARN" message="Rejected records: #[payload.rejected]"/>
+                <flow-ref name="Log-Rejected-Records"/>
+            </when>
+        </choice>
+    </sub-flow>
+
+    <!-- ========================================================================= -->
+    <!-- Apply Business Rules to Batch                                            -->
+    <!-- ========================================================================= -->
+
+    <sub-flow name="Apply-Business-Rules-Batch-Flow">
+        <description>
+            Applies all configured business rules to each valid record.
+            Processes records in parallel using a foreach or scatter-gather pattern.
+        </description>
+
+        <foreach collection="#[vars.validRecords]">
+            <flow-ref name="Apply-Business-Rules-Sub-Flow"/>
+            <set-variable value="#[vars.enrichedRecords default [] ++ [payload]]" variableName="enrichedRecords"/>
+        </foreach>
+
+        <set-payload value="#[vars.enrichedRecords]"/>
+    </sub-flow>
+
+    <!-- ========================================================================= -->
+    <!-- Transform to SKY API Payload                                             -->
+    <!-- ========================================================================= -->
+
+    <sub-flow name="Transform-To-SKY-Payload-Flow">
+        <description>
+            Transforms validated and enriched CSV records into the
+            SKY API journal entry batch payload structure using DataWeave.
+        </description>
+
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload>
+                    <![CDATA[%dw 2.0
+                    import * from csv-to-journal
+                    output application/json
+                    ---
+                    var batchConfig = {
+                        description: "Salesforce GL Import - " ++ (now() as String {format: "yyyy-MM-dd HH:mm:ss"}),
+                        postDate: now() as String {format: "yyyy-MM-dd"},
+                        sourceSystemName: "Salesforce",
+                        journalEntryBatchType: "Standard"
+                    }
+                    ---
+                    transformToJournalEntryBatch(payload, batchConfig)]]>
+                </ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </sub-flow>
+
+    <!-- ========================================================================= -->
+    <!-- Generate Processing Summary                                              -->
+    <!-- ========================================================================= -->
+
+    <sub-flow name="Generate-Processing-Summary">
+        <description>
+            Generates a processing summary response with status counts.
+        </description>
+
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload>
+                    <![CDATA[%dw 2.0
+                    output application/json
+                    ---
+                    {
+                        status: "COMPLETED",
+                        transactionId: vars.transactionId,
+                        summary: {
+                            totalRecords: sizeOf(vars.validRecords) + sizeOf(vars.rejectedRecords default []),
+                            processed: sizeOf(vars.validRecords),
+                            rejected: sizeOf(vars.rejectedRecords default []),
+                            successful: if (payload.status == "SUCCESS") sizeOf(vars.validRecords) else 0,
+                            failed: if (payload.status == "FAILED") sizeOf(vars.validRecords) else 0
+                        },
+                        batchResult: payload,
+                        timestamp: now() as String {format: "yyyy-MM-dd'T'HH:mm:ssZ"}
+                    }]]>
+                </ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </sub-flow>
+
+</mule>

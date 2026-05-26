@@ -1,0 +1,91 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:file="http://www.mulesoft.org/schema/mule/file"
+      xmlns:os="http://www.mulesoft.org/schema/mule/objectstore"
+      xmlns:dw="http://www.mulesoft.org/schema/mule/ee/dw"
+      xmlns:secure-properties="http://www.mulesoft.org/schema/mule/secure-properties"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+        http://www.mulesoft.org/schema/mule/file http://www.mulesoft.org/schema/mule/file/current/mule-file.xsd
+        http://www.mulesoft.org/schema/mule/objectstore http://www.mulesoft.org/schema/mule/objectstore/current/mule-objectstore.xsd
+        http://www.mulesoft.org/schema/mule/ee/dw http://www.mulesoft.org/schema/mule/ee/dw/current/dw.xsd
+        http://www.mulesoft.org/schema/mule/secure-properties http://www.mulesoft.org/schema/mule/secure-properties/current/mule-secure-properties.xsd">
+
+    <!-- ========================================================================= -->
+    <!-- Global Configuration                                                     -->
+    <!-- ========================================================================= -->
+
+    <!-- Property Placeholder Configuration -->
+    <configuration-properties file="application.properties"/>
+    <configuration-properties file="${environment}/application.properties"/>
+    <configuration-properties file="business-rules.properties"/>
+
+    <!-- Secure Properties (for encrypted secrets) -->
+    <secure-properties:config name="SecurePropertiesConfig"
+                              file="secure.properties"
+                              key="${secure.key}"/>
+
+    <!-- ========================================================================= -->
+    <!-- HTTP Listener Configuration (Experience API)                             -->
+    <!-- ========================================================================= -->
+
+    <http:listener-config name="HTTP-Listener-Config">
+        <http:listener-connection host="${http.host}" port="${http.port}"/>
+    </http:listener-config>
+
+    <!-- ========================================================================= -->
+    <!-- HTTP Request Configuration (System API - SKY API Client)                 -->
+    <!-- ========================================================================= -->
+
+    <http:request-config name="SKY-API-HTTP-Config">
+        <http:request-connection host="api.sky.blackbaud.com"
+                                  port="443"
+                                  protocol="HTTPS">
+            <http:authentication>
+                <http:token-authentication token="${bearerToken}" />
+            </http:authentication>
+        </http:request-connection>
+    </http:request-config>
+
+    <!-- ========================================================================= -->
+    <!-- HTTP Request for OAuth Token Endpoint                                    -->
+    <!-- ========================================================================= -->
+
+    <http:request-config name="SKY-OAuth-HTTP-Config">
+        <http:request-connection host="oauth2.sky.blackbaud.com"
+                                  port="443"
+                                  protocol="HTTPS"/>
+    </http:request-config>
+
+    <!-- ========================================================================= -->
+    <!-- File Connector Configuration (CSV Input/Output)                         -->
+    <!-- ========================================================================= -->
+
+    <file:config name="File-Input-Config">
+        <file:connection workingDir="${csv.input.directory}"/>
+    </file:config>
+
+    <file:config name="File-Archive-Config">
+        <file:connection workingDir="${csv.archive.directory}"/>
+    </file:config>
+
+    <file:config name="File-Error-Config">
+        <file:connection workingDir="${csv.error.directory}"/>
+    </file:config>
+
+    <file:config name="File-Output-Config">
+        <file:connection workingDir="${output.status.directory}"/>
+    </file:config>
+
+    <!-- ========================================================================= -->
+    <!-- Object Store Configuration (Token Caching)                              -->
+    <!-- ========================================================================= -->
+
+    <os:objectstore-config name="Token-ObjectStore" persistent="true">
+        <os:expiration-registry entryTtl="3600" expirationInterval="60"/>
+    </os:objectstore-config>
+
+</mule>

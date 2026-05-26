@@ -1,0 +1,142 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xmlns:dw="http://www.mulesoft.org/schema/mule/ee/dw"
+      xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/ee/dw http://www.mulesoft.org/schema/mule/ee/dw/current/dw.xsd
+        http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/ee.xsd">
+
+    <!-- ========================================================================= -->
+    <!-- Logging Layer                                                             -->
+    <!-- ========================================================================= -->
+    <!--
+        Structured logging for the GL integration.
+        
+        Log Fields:
+        - TransactionId
+        - SourceRecordId
+        - Timestamp
+        - Status
+        - RequestPayload
+        - ResponsePayload
+        - ErrorMessage
+        
+        Log Categories:
+        - Integration Log: main processing log
+        - Error Log: error events only
+        - Audit Log: processing summaries for audit trail
+    ========================================================================= -->
+
+    <!-- ========================================================================= -->
+    <!-- Log Processing Result                                                    -->
+    <!-- ========================================================================= -->
+
+    <sub-flow name="Log-Processing-Result-Flow">
+        <description>
+            Logs the processing result for a batch of records.
+            Creates a structured audit log entry.
+        </description>
+
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload>
+                    <![CDATA[%dw 2.0
+                    output application/json
+                    ---
+                    {
+                        "transactionId": vars.transactionId,
+                        "timestamp": now() as String {format: "yyyy-MM-dd'T'HH:mm:ssZ"},
+                        "status": payload.status,
+                        "batchId": payload.batchId default null,
+                        "httpStatus": payload.httpStatus default null,
+                        "recordCount": sizeOf(vars.validRecords),
+                        "rejectedCount": sizeOf(vars.rejectedRecords default []),
+                        "environment": p("environment"),
+                        "processingMode": p("processing.mode"),
+                        "mockMode": p("sky.api.mock.enabled")
+                    }]]>
+                </ee:set-payload>
+            </ee:message>
+        </ee:transform>
+
+        <!-- Audit log (INFO level) -->
+        <logger level="INFO" category="com.mulesoft.integration.audit"
+                message="AUDIT: Transaction #[payload.transactionId] - #[payload.status] - #[payload.recordCount] records"/>
+
+        <!-- Integration log (DEBUG level with full details) -->
+        <logger level="DEBUG" category="com.mulesoft.integration"
+                message="Processing Result: #[payload]"/>
+    </sub-flow>
+
+    <!-- ========================================================================= -->
+    <!-- Log Error                                                                -->
+    <!-- ========================================================================= -->
+
+    <sub-flow name="Log-Error-Flow">
+        <description>
+            Logs an error event with structured format.
+            Used by error handlers across all layers.
+        </description>
+
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload>
+                    <![CDATA[%dw 2.0
+                    output application/json
+                    ---
+                    {
+                        "transactionId": vars.transactionId default "N/A",
+                        "timestamp": now() as String {format: "yyyy-MM-dd'T'HH:mm:ssZ"},
+                        "status": "ERROR",
+                        "errorType": error.errorType.namespace ++ ":" ++ error.errorType.identifier,
+                        "errorMessage": error.description,
+                        "sourceRecordId": payload.ReferenceNumber default (payload.recordId default "N/A"),
+                        "retryCount": vars.retryCount default 0,
+                        "environment": p("environment")
+                    }]]>
+                </ee:set-payload>
+            </ee:message>
+        </ee:transform>
+
+        <!-- Log at ERROR level -->
+        <logger level="ERROR" category="com.mulesoft.integration.error"
+                message="ERROR: #[payload.transactionId] - #[payload.errorType] - #[payload.errorMessage]"/>
+    </sub-flow>
+
+    <!-- ========================================================================= -->
+    <!-- Log Record Processing                                                     -->
+    <!-- ========================================================================= -->
+
+    <sub-flow name="Log-Record-Processing">
+        <description>
+            Logs the processing of an individual CSV record.
+        </description>
+
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload>
+                    <![CDATA[%dw 2.0
+                    output application/json
+                    ---
+                    {
+                        "transactionId": vars.transactionId,
+                        "sourceRecordId": payload.ReferenceNumber default "UNKNOWN",
+                        "timestamp": now() as String {format: "yyyy-MM-dd'T'HH:mm:ssZ"},
+                        "status": "PROCESSED",
+                        "amount": payload.Amount default null,
+                        "journal": payload.Journal default null,
+                        "creditAccount": payload.CreditAccountNumber default null,
+                        "debitAccount": payload.DebitAccountNumber default null,
+                        "description": (payload.Description default "")[0..49]
+                    }]]>
+                </ee:set-payload>
+            </ee:message>
+        </ee:transform>
+
+        <logger level="DEBUG" category="com.mulesoft.integration"
+                message="Record Processed: #[payload.sourceRecordId] - #[payload.amount]"/>
+    </sub-flow>
+
+</mule>

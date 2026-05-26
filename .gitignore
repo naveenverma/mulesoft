@@ -1,0 +1,27 @@
+# Mule
+target/
+.classpath
+.project
+.settings/
+*.iml
+.idea/
+*.log
+*.class
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment-specific config (keep templates, ignore actual secrets)
+src/main/resources/dev/*.properties
+src/main/resources/staging/*.properties
+src/main/resources/production/*.properties
+!src/main/resources/dev/application-template.properties
+!src/main/resources/staging/application-template.properties
+!src/main/resources/production/application-template.properties
+
+# Sample data
+src/test/resources/*.csv
+
+# Mule runtime
+.mule/
